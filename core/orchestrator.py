@@ -13,7 +13,6 @@ from core.isolation import (
     create_isolation,
     isolation_destination,
     release_isolation,
-    _make_sources_readonly,
 )
 from core.deps import venv_python
 from core.packets import (
@@ -26,6 +25,7 @@ from core.packets import (
     new_run_id,
     utc_now,
 )
+from core.findings import write_findings
 from core.report import append_result, write_reports
 from core.runner import sanitized_env
 from policies import sable
@@ -57,13 +57,44 @@ class Vesper:
         self.dry_run = bool(config.get("dry_run", True))
         self.timeout = int((config.get("pytest") or {}).get("timeout_seconds") or 120)
         self.role_results: list[RoleResult] = []
+        self._scope: Any = None
+        self._diff_fallback: str = ""
 
-    def run(self, project: Path, docs: Path) -> FinalReport:
+    def _compute_diff_scope(self, project: Path, docs: Path) -> Any:
+        """Return a DiffScope for ``--diff``, or ``None`` for a full run.
+
+        A diff mode that cannot compute its scope (no git, bad ref, too many
+        files) never silently skips: it falls back to a full run and remembers
+        why, so the report can say so.
+        """
+        diff_cfg = self.config.get("diff") or {}
+        base_ref = str(diff_cfg.get("base_ref") or "").strip()
+        self._diff_fallback = ""
+        if not base_ref:
+            return None
+        from core.diffscope import DiffScopeError, compute_diff_scope
+
+        try:
+            return compute_diff_scope(
+                project.resolve(),
+                base_ref,
+                docs.resolve(),
+                max_files=int(diff_cfg.get("max_files") or 200),
+            )
+        except DiffScopeError as exc:
+            self._diff_fallback = (
+                f"diff scope unavailable ({exc}); running the full cycle"
+            )
+            return None
+
+    def run(self, project: Path, docs: Path, exceptions: list[Any] | None = None) -> FinalReport:
         from core.sandbox import get_sandbox_status, resolve_sandbox_mode
 
         # Validate operator config before any isolated copy exists, so an
         # invalid sandbox mode cannot leak a copy under the temp directory.
         resolve_sandbox_mode(self.config)
+        self.exceptions = list(exceptions or [])
+        self._scope = self._compute_diff_scope(project, docs)
         started = utc_now()
         run_id = new_run_id()
         base = Path(self.config.get("reports_dir") or "reports").resolve()
@@ -122,31 +153,69 @@ class Vesper:
             tested_tree=isolation.tested_tree,
         )
         report.timings = {"isolation": round(_isolation_seconds, 3)}
+        warn_skipped = [rec for rec in isolation.skipped if not rec["reason"].startswith("secret")]
+        if warn_skipped:
+            # A path the copy could not carry is never a silent drop: the
+            # operator must see which files are missing from the isolated tree.
+            report.warnings.append(
+                "isolation skipped "
+                + str(len(warn_skipped))
+                + " path(s): "
+                + "; ".join(f"{rec['path']} [{rec['reason']}]" for rec in warn_skipped)
+            )
 
-        if failure_reason:
+        blocked_reason = ""
+        if self._scope is not None:
+            report.diff = {"mode": "diff", **self._scope.to_dict()}
+        elif self.config.get("diff") and (self.config.get("diff") or {}).get("base_ref"):
+            report.diff = {
+                "mode": "full",
+                "reason": self._diff_fallback,
+                "base_ref": str((self.config.get("diff") or {}).get("base_ref")),
+            }
+            report.warnings.append(self._diff_fallback)
+        if self._scope is not None:
             append_result(
                 self.role_results,
                 RoleResult(
                     role=Role.VESPER.value,
                     stage=Stage.INIT.value,
-                    verdict=Verdict.VETO.value,
-                    summary=f"sandbox required but bwrap unavailable: {failure_reason}",
+                    verdict=Verdict.CLEAR.value,
+                    summary=(
+                        f"diff mode vs {self._scope.base_ref}: "
+                        f"{len(self._scope.changed)} changed file(s)"
+                    ),
+                    details=self._scope.to_dict(),
+                ),
+            )
+        if failure_reason:
+            # A required sandbox that cannot start is an environment stop, not an
+            # accusation against the project. The cycle still runs Lexi, Aria,
+            # Riley and the Sable pre-flight (strictly, because sandboxed=False),
+            # so dangerous code is still VETOed; only execution is skipped.
+            # Staying on the normal path also releases the isolated copy, which
+            # the previous early return leaked.
+            blocked_reason = f"sandbox required but bwrap unavailable: {failure_reason}"
+            append_result(
+                self.role_results,
+                RoleResult(
+                    role=Role.VESPER.value,
+                    stage=Stage.INIT.value,
+                    verdict=Verdict.BLOCKED_ENV.value,
+                    summary=blocked_reason,
                     details={"sandbox": sandbox_status, "error": failure_reason},
                 ),
             )
-            report.verdict = Verdict.VETO.value
-            report.role_results = list(self.role_results)
-            report.finished_at = utc_now()
-            write_reports(report, base)
-            return report
 
         try:
             try:
-                self._loop(packet, isolation, work_dir, report)
+                self._loop(packet, isolation, work_dir, report, blocked_reason=blocked_reason)
             finally:
                 report.role_results = list(self.role_results)
                 report.finished_at = utc_now()
                 write_reports(report, base)
+                findings_base = Path(self.config.get("findings_dir") or base).resolve()
+                write_findings(report, findings_base, exceptions=getattr(self, "exceptions", None))
         finally:
             release_isolation(isolation, keep=bool(self.config.get("keep_isolated_copy", False)))
         return report
@@ -157,12 +226,22 @@ class Vesper:
         isolation: IsolationHandle,
         work_dir: Path,
         report: FinalReport,
+        blocked_reason: str = "",
     ) -> None:
         isolated = isolation.isolated_root
         docs = Path(packet.docs_root)
 
+        # Diff mode threads a per-role scope through every collector; a full run
+        # leaves all of these None so behaviour is byte-for-byte unchanged.
+        scope = getattr(self, "_scope", None)
+        docs_allowlist = set(scope.lexi_docs_allowlist) if scope is not None else None
+        changed_code = set(scope.changed_code) if scope is not None else None
+        only_paths = set(scope.riley_sable_paths) if scope is not None else None
+        nova_targets = list(scope.nova_test_targets) if scope is not None else None
+
         # 1. Lexi drift check
         drift = None
+        drift_veto = False
         for attempt in range(1, self.max_stage_iterations + 1):
             packet = packet.next(
                 stage=Stage.DRIFT_CHECK.value,
@@ -174,6 +253,8 @@ class Vesper:
                 project_root=isolated,
                 config=self.config,
                 live_root=isolation.live_root,
+                docs_allowlist=docs_allowlist,
+                changed_code=changed_code,
             )
             append_result(
                 self.role_results,
@@ -190,10 +271,14 @@ class Vesper:
             report.drift = drift.to_dict()
             if drift.verdict != Verdict.VETO.value:
                 break
-            # Drift is not something this loop can patch; stop after first veto.
-            report.verdict = Verdict.VETO.value
-            report.escalation = ""
-            return
+            # A drift veto is an accusation, not a reason to stop looking. Lexi
+            # cannot patch documentation in this loop, so it vetoes once and the
+            # pipeline keeps going: the operator still gets Riley, Sable and Nova,
+            # and the report shows what the tests actually did. The veto itself is
+            # applied in the final hierarchy below, where it outranks an
+            # environmental stop and a clean run.
+            drift_veto = True
+            break
 
         assert drift is not None
 
@@ -235,7 +320,7 @@ class Vesper:
                 to_role=Role.RILEY.value,
                 payload=plan.to_dict(),
             )
-            review = riley.review_plan(plan, config=self.config, project_root=isolated)
+            review = riley.review_plan(plan, config=self.config, project_root=isolated, only_paths=only_paths)
             append_result(
                 self.role_results,
                 RoleResult(
@@ -253,6 +338,11 @@ class Vesper:
                 break
             gaps = review.gaps + review.required_changes
             if attempt >= self.max_stage_iterations:
+                if drift_veto:
+                    # The answer is already a veto from the drift stage; an
+                    # escalation would replace it with a different one. Keep the
+                    # accusation intact and let execution still be reported.
+                    break
                 report.verdict = Verdict.ESCALATE.value
                 report.escalation = ESCALATE_DOMAIN
                 return
@@ -260,7 +350,7 @@ class Vesper:
         assert plan is not None and review is not None
 
         # 4. Sable pre-flight
-        command = sable.default_command(isolated, work_dir)
+        command = sable.default_command(isolated, work_dir, test_targets=nova_targets)
         env = sanitized_env(allow_network=self.allow_network)
         env["HOME"] = str(work_dir / "home")
         packet = packet.next(
@@ -278,6 +368,7 @@ class Vesper:
             cwd=isolated,
             allow_in_tests=(self.config.get("sable") or {}).get("allow_in_tests"),
             sandboxed=report.sandbox == "bwrap",
+            only_paths=only_paths,
         )
         allowed_note = ""
         if policy.allowed:
@@ -342,9 +433,37 @@ class Vesper:
                 report.verdict = Verdict.VETO.value
                 return
 
+        if blocked_reason:
+            # Nothing may execute without the required sandbox. Every stage above
+            # already ran, so a dangerous project has been VETOed by now and an
+            # environment stop is only reported for a project that passed them.
+            # A drift veto held from stage 1 still outranks the environment stop:
+            # the accusation was already made, and losing it here would make the
+            # hierarchy depend on whether a sandbox happened to be available.
+            report.post_audit = {"root_cause": blocked_reason}
+            report.mutation = {
+                "status": "skipped",
+                "reason": (
+                    "drift veto: docs and code disagree"
+                    if drift_veto
+                    else "environment blocked before execution"
+                ),
+            }
+            report.verdict = (
+                Verdict.VETO.value if drift_veto else Verdict.BLOCKED_ENV.value
+            )
+            return
+
         sable.install_runtime_guards(work_dir)
-        _make_sources_readonly(isolated)
-        isolation.read_only = True
+        # The isolated copy is a standalone checkout that the tested process may
+        # write into (output directories, a local sqlite database, generated
+        # fixtures), exactly like a normal working tree. We deliberately do NOT
+        # strip its write bits: a read-only copy turns legitimate in-tree writes
+        # into PermissionError and mislabels them as product defects. The live
+        # tree is still never written - it is a different directory, mounted
+        # read-only (or not mounted at all) inside the sandbox, so the isolation
+        # guarantee is preserved by structure, not by hardening the copy against
+        # its own tests.
 
         # 5. Nova execute
         packet = packet.next(
@@ -360,6 +479,7 @@ class Vesper:
             allow_network=self.allow_network,
             timeout=self.timeout,
             config=self.config,
+            test_targets=nova_targets,
         )
         _execute_seconds = time.monotonic() - _execute_started
         report.timings["execute"] = round(_execute_seconds, 3)
@@ -386,6 +506,12 @@ class Vesper:
                     f"failed={execution.failed} exit={execution.exit_code} "
                     f"duration={execution.duration_seconds}s install={execution.install_status} "
                     + (
+                        f"product_failed={execution.product_failed} "
+                        f"environment_failed={execution.environment_failed} "
+                        if execution.failures
+                        else ""
+                    )
+                    + (
                         "sandbox: unavailable (ran unsandboxed)"
                         if execution.sandbox_status == "unavailable"
                         else f"sandbox: {execution.sandbox_status} (ran unsandboxed)"
@@ -399,6 +525,9 @@ class Vesper:
                     "failed": execution.failed,
                     "skipped": execution.skipped,
                     "errors": execution.errors,
+                    "product_failed": execution.product_failed,
+                    "environment_failed": execution.environment_failed,
+                    "failures": execution.to_dict().get("failures") or [],
                     "exit_code": execution.exit_code,
                     "duration_seconds": execution.duration_seconds,
                     "command": execution.command,
@@ -435,7 +564,7 @@ class Vesper:
             to_role=Role.RILEY.value,
             payload=execution.to_dict(),
         )
-        result_review = riley.review_results(plan, execution.to_dict(), config=self.config, project_root=isolated)
+        result_review = riley.review_results(plan, execution.to_dict(), config=self.config, project_root=isolated, only_paths=only_paths)
         append_result(
             self.role_results,
             RoleResult(
@@ -453,6 +582,8 @@ class Vesper:
             config=self.config,
             execution=execution.to_dict(),
             live_root=isolation.live_root,
+            docs_allowlist=docs_allowlist,
+            changed_code=changed_code,
         )
         append_result(
             self.role_results,
@@ -480,12 +611,29 @@ class Vesper:
             "root_cause": root_cause,
         }
 
-        # Veto hierarchy: Sable > Riley > Lexi (Sable applied first)
+        # Veto hierarchy: Sable > Riley > Lexi (Sable applied first). An
+        # environmental stop may only soften the technical blocks that say "the
+        # tests did not run"; it never softens a real accusation, and Riley
+        # returns BLOCKED_ENV only when no test failed.
+        env_blocked = result_review.verdict == Verdict.BLOCKED_ENV.value
         if post_policy.verdict == Verdict.BLOCK.value:
-            report.mutation = {"status": "skipped", "reason": "baseline tests did not pass"}
-            report.verdict = Verdict.VETO.value
+            # Sable's post-execution block only says the baseline did not pass, so
+            # an environmental cause can soften it - except a command that is not
+            # pytest-only, which is a policy violation on its own.
+            blocked_by_env = env_blocked and post_policy.checks.get("pytest_only", False)
+            report.mutation = {
+                "status": "skipped",
+                "reason": (
+                    "environment blocked: the tests could not run"
+                    if blocked_by_env
+                    else "baseline tests did not pass"
+                ),
+            }
+            report.verdict = (
+                Verdict.BLOCKED_ENV.value if blocked_by_env else Verdict.VETO.value
+            )
             return
-        if nova_failed or result_review.verdict == Verdict.VETO.value:
+        if (nova_failed and not env_blocked) or result_review.verdict == Verdict.VETO.value:
             report.mutation = {"status": "skipped", "reason": "baseline tests did not pass"}
             report.verdict = Verdict.VETO.value
             return
@@ -493,11 +641,31 @@ class Vesper:
             report.mutation = {"status": "skipped", "reason": "baseline tests did not pass"}
             report.verdict = Verdict.VETO.value
             return
+        if drift_veto:
+            # The stage-1 drift veto: same rank as the post-audit one, applied
+            # after Sable and Riley so a stronger accusation is never hidden, and
+            # before the environmental softening so a veto is never downgraded.
+            report.mutation = {
+                "status": "skipped",
+                "reason": "drift veto: docs and code disagree",
+            }
+            report.verdict = Verdict.VETO.value
+            return
+        if env_blocked:
+            report.mutation = {
+                "status": "skipped",
+                "reason": "environment blocked: the tests could not run",
+            }
+            report.verdict = Verdict.BLOCKED_ENV.value
+            return
 
         mutation_cfg = dict(self.config.get("mutation") or {})
         mutation_enabled = bool(mutation_cfg.get("enabled", False))
 
-        if not mutation_enabled:
+        if self._scope is not None:
+            # Diff mode is a fast pre-push check: mutation testing is off.
+            report.mutation = {"status": "skipped", "reason": "diff mode"}
+        elif not mutation_enabled:
             report.mutation = {"status": "skipped", "reason": "disabled"}
         else:
             py_bin = None

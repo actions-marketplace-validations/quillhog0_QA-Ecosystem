@@ -31,10 +31,22 @@ llm:
   model: openai/gpt-4o-mini
   call_in_dry_run: false
   timeout_seconds: 45
+  # Lets only the QA process reach the provider. The tested project's pytest
+  # run stays offline; that is governed separately by top-level allow_network.
+  allow_network: false
   # base_url: http://127.0.0.1:11434/v1
 
 pytest:
   timeout_seconds: 120
+
+# Operator-owned exception policy (see docs/exceptions.md). Exceptions never
+# live in the project under test. By default the file is
+# exceptions/<project-name>.yaml under this repository; `file` overrides it and
+# `max_days` caps how far ahead an expiry may sit.
+exceptions:
+  # file: exceptions/my-project.yaml
+  dir: exceptions
+  max_days: 90
 
 sable:
   allow_in_tests:

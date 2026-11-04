@@ -7,6 +7,7 @@ import argparse
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Permit network for the isolated pytest process (off by default)",
     )
     parser.add_argument(
+        "--llm-network",
+        action="store_true",
+        help="Permit network only for the QA process's own LLM provider call; "
+        "the tested project's pytest run still stays offline (off by default)",
+    )
+    parser.add_argument(
         "--no-dry-run",
         action="store_true",
         help="Allow optional LLM calls when configured; still never deletes the live tree",
@@ -61,6 +68,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--reports-dir",
         default="",
         help="Override reports directory",
+    )
+    parser.add_argument(
+        "--findings-dir",
+        default="",
+        help="Where findings.json/findings.md are written (default: same as --reports-dir)",
     )
     parser.add_argument(
         "--strict",
@@ -100,6 +112,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--sarif",
         default="",
         help="Write a SARIF 2.1.0 document describing the run's findings to this path",
+    )
+    parser.add_argument(
+        "--diff",
+        default="",
+        metavar="BASE_REF",
+        help="Fast pre-push mode: scope the run to files changed since BASE_REF "
+        "(e.g. origin/master or HEAD~5). Mutation testing is off; if the scope "
+        "cannot be computed the full cycle runs instead.",
     )
     return parser.parse_args(argv)
 
@@ -145,6 +165,9 @@ def main(argv: list[str] | None = None) -> int:
         config["dry_run"] = False
     if args.allow_network:
         config["allow_network"] = True
+    if args.llm_network:
+        config["llm"] = dict(config.get("llm") or {})
+        config["llm"]["allow_network"] = True
     if args.strict:
         config.setdefault("riley", {})
         config["riley"] = dict(config.get("riley") or {})
@@ -175,6 +198,11 @@ def main(argv: list[str] | None = None) -> int:
         config["reports_dir"] = args.reports_dir
     else:
         config.setdefault("reports_dir", str(here / "reports"))
+    if args.findings_dir:
+        config["findings_dir"] = args.findings_dir
+    if args.diff:
+        config["diff"] = dict(config.get("diff") or {})
+        config["diff"]["base_ref"] = args.diff
     if args.self_test:
         # Copy the working tree, not HEAD, so uncommitted tests are included.
         config["isolation_method"] = "copy"
@@ -182,22 +210,41 @@ def main(argv: list[str] | None = None) -> int:
         config["pytest"] = dict(config.get("pytest") or {})
         config["pytest"].setdefault("timeout_seconds", 180)
 
+    # Load operator exceptions at startup. An invalid entry is a hard config
+    # error (never a silent ignore), so a typo cannot quietly disable a guard.
+    from core.exceptions import ExceptionsConfigError, load_exceptions
+
+    project_name = project.resolve().name
+    try:
+        exception_entries = load_exceptions(config, project_name)
+    except ExceptionsConfigError as exc:
+        print(f"exceptions config error: {exc}", file=sys.stderr)
+        return 1
+
+    started_monotonic = time.monotonic()
     try:
         vesper = Vesper(config)
-        report = vesper.run(project, docs)
+        report = vesper.run(project, docs, exceptions=exception_entries)
     finally:
         # Docs bundle is synthetic; never delete the live tree.
         if docs_cleanup is not None:
             shutil.rmtree(docs_cleanup, ignore_errors=True)
+    elapsed_seconds = time.monotonic() - started_monotonic
 
     reports_dir = Path(config["reports_dir"])
     print(f"verdict={report.verdict}")
+    print(f"elapsed={elapsed_seconds:.1f}s")
     if report.escalation:
         print(report.escalation)
     print(f"sandbox={report.sandbox}")
+    for warning in getattr(report, "warnings", []) or []:
+        print(f"WARN {warning}")
     if report.mutation and report.mutation.get("status") == "completed":
         print(f"mutation_score={report.mutation.get('score', 0.0):.2f}")
     print(f"report={reports_dir / (report.run_id + '.md')}")
+    findings_base = Path(config.get("findings_dir") or reports_dir)
+    print(f"findings={findings_base / report.run_id / 'findings.md'}")
+    print(f"findings_latest={findings_base / 'latest' / 'findings.md'}")
     print(f"isolated_root={report.isolated_root}")
     if args.sarif:
         try:
