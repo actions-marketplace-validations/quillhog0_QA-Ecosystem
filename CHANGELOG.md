@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.3 (2026-11-05)
+
+### Fixed
+- **BLOCKED_ENV "missing TypeScript tooling" on every fresh runner** (regression in 0.4.2): the pinned QA artifact `agents/vendor/typescript.js` was git-ignored and therefore absent from the released action, so `ensure_ts_tooling` could never populate `~/.cache/qa-ecosystem/tooling` and every TypeScript project stopped with `BLOCKED_ENV` before any test ran. The pinned file (SHA-256 `3ae902c9…e7675`, Apache-2.0, see `agents/vendor/LICENSE`) is now tracked.
+- **Summary language fallback**: when a run produced no execution data (e.g. `BLOCKED_ENV`), the summary reported `Languages: python` regardless of the project or `--languages`. It now reports the detected/selected languages of the tested tree.
+
+### Added
+- Regression tests `tests/unit/test_vendor_ts_tooling.py`: vendor artifact is tracked and matches the pin; `ensure_ts_tooling` works with an empty HOME and no `QA_TOOLING_DIR`; summary language fallback.
+
+## 0.4.2 (2026-11-05)
+
+### Fixed
+- **Determinism across test plan design and review**:
+  - Aria test plan generation for pure TypeScript/JavaScript projects: discover JS/TS sources and test function declarations (`it(...)` / `test(...)`) so baseline (S1) and negative-path (S3) scenarios are generated deterministically on attempt 1, even when documentation lacks explicit error keywords.
+  - Two-pass helper assertion discovery in `ts_analyzer.js` with alphabetical file iteration sorting, eliminating ordering variance between test and helper files.
+  - Refined swallowed-catch detection in `ts_analyzer.js`: try/catch blocks wrapping external process execution are not flagged as weak tests when valid assertions exist outside the try block.
+  - Deterministic gap reporting: Riley gap lists and root cause explanations sort weak test identifiers before formatting.
+- **Security hardening for TypeScript compiler tooling**:
+  - Reverted project-supplied compiler fallbacks in `ensure_ts_tooling` and `resolveTypeScript`: the tested project's `node_modules` (local or parent) and cached project `node_modules` trees are never executed or cached. Only QA-controlled sources (`QA_TOOLING_DIR` or `~/.cache/qa-ecosystem/tooling` populated from QA's pinned artifact verified with SHA-256) are permitted.
+  - When TypeScript tooling is missing or unverified for a TypeScript project, the pipeline stops with `BLOCKED_ENV` rather than falling back to project code.
+- **Lexi false positives on README claims**:
+  - Third-party CLI tools (`npm`, `npx`, `pip`, `git`, `docker`, `node`): subcommands (such as `ci`) and flags (such as `--omit=dev`) are recognized as third-party invocations and excluded from project CLI checks.
+  - Dot-delimited package names (`sql.js`, `chart.js`, `node.js`, `next.js`) and markdown links (`[sql.js](...)`) are excluded from method call-form verification.
+
+### Added
+- Benchmark fixtures:
+  - `ts_plan_determinism` & `py_plan_determinism`: verify identical plan acceptance and verdict across clean and warm cache runs.
+  - `ts_third_party_cli_fp` & `py_third_party_cli_fp`: verify third-party CLI flags/subcommands and dotted package names produce CLEAR.
+  - `ts_malicious_node_modules`: verify project `node_modules/typescript` cannot inject code into QA tooling.
+- Regression unit tests in `tests/unit/test_determinism.py`, `tests/unit/test_security_ts_tooling.py`, and `tests/unit/test_task14_plan_determinism_mutation.py`.
+
 ## 0.4.1 (2026-11-04)
 
 ### Fixed
