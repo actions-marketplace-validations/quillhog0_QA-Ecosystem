@@ -32,6 +32,27 @@ from policies import sable
 
 
 ESCALATE_DOMAIN = "ESCALATE: DOMAIN_EXPERT"
+VALID_PROFILES = ("default", "factory")
+VALID_FAIL_ON = ("P0", "P1", "P2", "P3")
+
+
+def apply_profile(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate and apply ``profile`` and ``fail_on`` defaults on ``config``."""
+    profile = str(config.get("profile") or "default").strip().lower()
+    if profile not in VALID_PROFILES:
+        raise ValueError(f"invalid profile: {profile}")
+    if profile == "factory":
+        config.setdefault("fail_on", "P2")
+        config.setdefault("identity_strict", not bool())
+        mut = dict(config.get("mutation") or {})
+        mut.setdefault("enabled", not bool())
+        config["mutation"] = mut
+    fail_on = str(config.get("fail_on") or "P1").strip().upper()
+    if fail_on not in VALID_FAIL_ON:
+        raise ValueError(f"invalid fail_on: {fail_on}")
+    config["profile"] = profile
+    config["fail_on"] = fail_on
+    return config
 
 
 def _relaxations_granted(policy: Any) -> bool:
@@ -51,7 +72,7 @@ def _relaxations_granted(policy: Any) -> bool:
 
 class Vesper:
     def __init__(self, config: dict[str, Any]):
-        self.config = config
+        self.config = apply_profile(config)
         self.max_stage_iterations = int(config.get("max_iterations") or 2)
         self.allow_network = bool(config.get("allow_network", False))
         self.dry_run = bool(config.get("dry_run", True))
@@ -225,9 +246,40 @@ class Vesper:
                 report.timings["total"] = round(time.monotonic() - _run_started, 3)
                 report.role_results = list(self.role_results)
                 report.finished_at = utc_now()
+                fail_on = str(self.config.get("fail_on") or "P1").upper()
+                write_brief = bool(self.config.get("fix_brief", not bool()))
+                baseline_fps = self.config.get("baseline_fingerprints")
+                if any((baseline_fps, fail_on != "P1")):
+                    from core.findings import build_document, build_findings
+
+                    raw_f = build_findings(report.to_dict())
+                    doc_after = build_document(
+                        report.to_dict(),
+                        exceptions=getattr(self, "exceptions", None),
+                        baseline=baseline_fps,
+                        fail_on=fail_on,
+                    )
+                    rem_veto = [
+                        f
+                        for f in (doc_after.get("findings") or [])
+                        if f.get("verdict_effect") == "VETO"
+                    ]
+                    exec_collected = int((report.execution or {}).get("collected") or 0)
+                    if rem_veto:
+                        report.verdict = Verdict.VETO.value
+                    elif all((raw_f, not rem_veto, bool(exec_collected))):
+                        report.verdict = Verdict.CLEAR.value
                 write_reports(report, base)
                 findings_base = Path(self.config.get("findings_dir") or base).resolve()
-                write_findings(report, findings_base, exceptions=getattr(self, "exceptions", None))
+                write_findings(
+                    report,
+                    findings_base,
+                    exceptions=getattr(self, "exceptions", None),
+                    baseline=baseline_fps,
+                    fail_on=fail_on,
+                    write_brief=write_brief,
+                    feedback_export=bool(self.config.get("feedback_export", bool())),
+                )
         finally:
             release_isolation(isolation, keep=bool(self.config.get("keep_isolated_copy", False)))
         return report
@@ -451,16 +503,24 @@ class Vesper:
                 report.verdict = Verdict.VETO.value
                 return
 
-        node_engine_blocked = False
+        node_engine_blocked = bool()
         from core.toolchain import check_node_engine, detect_languages, ensure_ts_tooling
+        from core.workspace import check_workspace_engines, discover_workspaces
+
+        workspaces = discover_workspaces(isolated)
         if not blocked_reason and "ts" in detect_languages(isolated):
             node_ok, node_msg = check_node_engine(isolated)
             if not node_ok:
                 blocked_reason = f"node engine precondition: {node_msg}"
-                node_engine_blocked = True
-            elif not ensure_ts_tooling():
-                blocked_reason = "missing TypeScript tooling (pinned typescript.js not found in QA cache)"
-                node_engine_blocked = True
+                node_engine_blocked = not bool()
+            else:
+                ws_ok, ws_msg = check_workspace_engines(isolated, workspaces)
+                if not ws_ok:
+                    blocked_reason = f"node engine precondition: {ws_msg}"
+                    node_engine_blocked = not bool()
+                elif not ensure_ts_tooling():
+                    blocked_reason = "missing TypeScript tooling (pinned typescript.js not found in QA cache)"
+                    node_engine_blocked = not bool()
 
         if blocked_reason:
             # Nothing may execute without the required sandbox. Every stage above
@@ -535,6 +595,11 @@ class Vesper:
                     f"failed={execution.failed} exit={execution.exit_code} "
                     f"duration={execution.duration_seconds}s install={execution.install_status} "
                     + (
+                        f"flaky={execution.flaky} status={execution.status} "
+                        if execution.flaky
+                        else ""
+                    )
+                    + (
                         f"product_failed={execution.product_failed} "
                         f"environment_failed={execution.environment_failed} "
                         if execution.failures
@@ -556,6 +621,9 @@ class Vesper:
                     "errors": execution.errors,
                     "product_failed": execution.product_failed,
                     "environment_failed": execution.environment_failed,
+                    "flaky": execution.flaky,
+                    "flaky_tests": execution.flaky_tests,
+                    "status": execution.status,
                     "failures": execution.to_dict().get("failures") or [],
                     "exit_code": execution.exit_code,
                     "duration_seconds": execution.duration_seconds,
@@ -643,15 +711,18 @@ class Vesper:
 
         live_project = Path(packet.project_root)
 
-        # Check deleted tests in diff mode
+        # Check deleted and weakened tests in diff mode
         deleted_tests: list[str] = []
-        if self._scope is not None and getattr(self._scope, "base_ref", None):
-            from core.diffscope import detect_deleted_tests
+        weakened_tests: list[str] = []
+        if all((self._scope is not None, getattr(self._scope, "base_ref", None))):
+            from core.diffscope import detect_deleted_tests, detect_weakened_tests
+
             deleted_tests = detect_deleted_tests(live_project, self._scope.base_ref)
+            weakened_tests = detect_weakened_tests(live_project, self._scope.base_ref)
 
         # Check clean install if requested
         clean_install_res: dict[str, Any] | None = None
-        if self.config.get("clean_install", False):
+        if self.config.get("clean_install", bool()):
             from core.clean_install import run_clean_install
             clean_install_res = run_clean_install(live_project, work_dir)
 
@@ -661,7 +732,9 @@ class Vesper:
             "root_cause": root_cause,
             "identity_leaks": identity_leaks,
             "deleted_tests": deleted_tests,
+            "weakened_tests": weakened_tests,
             "clean_install": clean_install_res,
+            "workspaces": workspaces,
         }
 
         p1_leaks = [leak for leak in identity_leaks if leak.get("priority") == "P1"]
@@ -691,18 +764,24 @@ class Vesper:
                 ),
             )
 
-        if deleted_tests:
+        if any((deleted_tests, weakened_tests)):
+            reason_label = "deleted tests in diff mode" if deleted_tests else "weakened tests in diff mode"
+            summary_label = (
+                f"{len(deleted_tests)} test(s) deleted in diff mode"
+                if deleted_tests
+                else f"{len(weakened_tests)} test(s) weakened in diff mode"
+            )
             append_result(
                 self.role_results,
                 RoleResult(
                     role=Role.RILEY.value,
                     stage="diff_tests_audit",
                     verdict=Verdict.VETO.value,
-                    summary=f"{len(deleted_tests)} test(s) deleted in diff mode",
-                    details={"deleted_tests": deleted_tests},
+                    summary=summary_label,
+                    details={"deleted_tests": deleted_tests, "weakened_tests": weakened_tests},
                 ),
             )
-            report.mutation = {"status": "skipped", "reason": "deleted tests in diff mode"}
+            report.mutation = {"status": "skipped", "reason": reason_label}
             report.verdict = Verdict.VETO.value
             return
 
@@ -770,14 +849,18 @@ class Vesper:
             return
 
         mutation_cfg = dict(self.config.get("mutation") or {})
-        mutation_enabled = bool(mutation_cfg.get("enabled", False))
+        mutation_enabled = bool(mutation_cfg.get("enabled", bool()))
 
-        if self._scope is not None:
-            # Diff mode is a fast pre-push check: mutation testing is off.
-            report.mutation = {"status": "skipped", "reason": "diff mode"}
-        elif not mutation_enabled:
-            report.mutation = {"status": "skipped", "reason": "disabled"}
+        if not mutation_enabled:
+            skip_reason = "diff mode" if self._scope is not None else "disabled"
+            report.mutation = {"status": "skipped", "reason": skip_reason}
         else:
+            run_cfg = dict(self.config)
+            if self._scope is not None:
+                run_cfg["mutation"] = {
+                    **mutation_cfg,
+                    "allowed_lines": dict(getattr(self._scope, "changed_lines", {})),
+                }
             py_bin = None
             venv_py = venv_python(work_dir)
             if venv_py.is_file():
@@ -787,10 +870,12 @@ class Vesper:
             mut_res = riley.audit_mutations(
                 isolated,
                 work_dir=work_dir,
-                config=self.config,
+                config=run_cfg,
                 allow_network=self.allow_network,
                 python=py_bin,
             )
+            if self._scope is not None:
+                mut_res["diff_scoped"] = not bool()
             report.timings["mutation"] = round(time.monotonic() - _mutation_started, 3)
             report.mutation = mut_res
             append_result(

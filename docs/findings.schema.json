@@ -2,7 +2,7 @@
   "type": "object",
   "required": ["schema_version", "run_id", "verdict", "generated_at", "counts", "findings"],
   "properties": {
-    "schema_version": {"type": "string", "enum": ["1"]},
+    "schema_version": {"type": "string", "enum": ["1", "1.0.0"]},
     "run_id": {"type": "string"},
     "verdict": {"type": "string", "enum": ["CLEAR", "VETO", "BLOCKED_ENV"]},
     "generated_at": {"type": "string"},
@@ -22,6 +22,13 @@
       "type": "array",
       "items": {"type": "object"}
     },
+    "false_positive_counts": {"type": "object"},
+    "downgraded_rules": {"type": "array", "items": {"type": "string"}},
+    "workspaces": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "workspace_verdicts": {"type": "object"},
     "findings": {
       "type": "array",
       "items": {
@@ -33,6 +40,8 @@
           "line",
           "priority",
           "type",
+          "class",
+          "confidence",
           "fingerprint",
           "customer_impact",
           "evidence",
@@ -47,13 +56,18 @@
           "code_file": {"type": ["string", "null"]},
           "code_line": {"type": ["integer", "null"]},
           "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
-          "type": {"type": "string", "enum": ["drift", "claim", "weak_test", "policy", "test_failure", "environment"]},
+          "type": {"type": "string", "enum": ["drift", "claim", "weak_test", "policy", "test_failure", "environment", "identity_leak", "clean_install", "deleted_tests", "mutation"]},
+          "class": {"type": "string", "enum": ["hard", "heuristic"]},
+          "confidence": {"type": "string", "enum": ["high", "low"]},
+          "package": {"type": ["string", "null"]},
           "fingerprint": {"type": "string"},
           "customer_impact": {"type": "string"},
           "evidence": {"type": "string"},
           "proposed_red_test": {"type": "string"},
           "verdict_effect": {"type": "string", "enum": ["VETO", "WARN", "INFO"]},
-          "excepted": {"type": ["string", "null"]}
+          "excepted": {"type": ["string", "null"]},
+          "exception_kind": {"type": ["string", "null"]},
+          "baselined": {"type": "boolean"}
         }
       }
     }

@@ -143,6 +143,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(e.g. origin/master or HEAD~5). Mutation testing is off; if the scope "
         "cannot be computed the full cycle runs instead.",
     )
+    parser.add_argument(
+        "--baseline",
+        default="",
+        metavar="PATH",
+        help="Path to a baseline findings.json file; recorded findings do not fail the gate",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["default", "factory"],
+        default=None,
+        help="Configuration profile: default or factory (fail-on=p2, identity-strict=true, mutation=true)",
+    )
+    parser.add_argument(
+        "--fail-on",
+        choices=["p0", "p1", "p2", "p3", "P0", "P1", "P2", "P3"],
+        default=None,
+        help="Minimum finding priority that triggers VETO (p0, p1, p2, p3; default p1)",
+    )
+    parser.add_argument(
+        "--fix-brief",
+        choices=["true", "false"],
+        default=None,
+        help="Generate fix-brief.md (true/false; default true)",
+    )
+    parser.add_argument(
+        "--no-fix-brief",
+        action="store_true",
+        help="Disable generation of fix-brief.md",
+    )
+    parser.add_argument(
+        "--feedback-export",
+        choices=["true", "false"],
+        default=None,
+        help="Opt-in anonymous feedback export (true/false; default false)",
+    )
     return parser.parse_args(argv)
 
 
@@ -158,6 +193,12 @@ def assemble_self_test_docs(repo: Path) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if os.environ.get("GITHUB_EVENT_NAME", "").strip() == "pull_request_target":
+        print(
+            "security error: refusing to execute under pull_request_target",
+            file=sys.stderr,
+        )
+        return 2
     args = parse_args(argv)
     here = Path(__file__).resolve().parent
 
@@ -183,6 +224,19 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(Path(args.config))
     config.setdefault("dry_run", True)
     config.setdefault("allow_network", False)
+    if args.profile:
+        config["profile"] = args.profile
+        from core.orchestrator import apply_profile
+
+        apply_profile(config)
+    if args.fail_on:
+        config["fail_on"] = args.fail_on.upper()
+    if args.fix_brief is not None:
+        config["fix_brief"] = args.fix_brief == "true"
+    if args.no_fix_brief:
+        config["fix_brief"] = bool()
+    if args.feedback_export is not None:
+        config["feedback_export"] = args.feedback_export == "true"
     if args.no_dry_run:
         config["dry_run"] = False
     os.environ["QA_LANGUAGES"] = args.languages
@@ -244,11 +298,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # Load operator exceptions at startup. An invalid entry is a hard config
     # error (never a silent ignore), so a typo cannot quietly disable a guard.
-    from core.exceptions import ExceptionsConfigError, load_exceptions, load_qa_ignore
+    from core.exceptions import (
+        ExceptionsConfigError,
+        load_baseline,
+        load_exceptions,
+        load_qa_ignore,
+    )
 
     project_name = project.resolve().name
     try:
         exception_entries = load_exceptions(config, project_name)
+        if args.baseline:
+            config["baseline_fingerprints"] = sorted(load_baseline(args.baseline))
     except ExceptionsConfigError as exc:
         print(f"exceptions config error: {exc}", file=sys.stderr)
         return 1
@@ -280,8 +341,14 @@ def main(argv: list[str] | None = None) -> int:
     findings_base = Path(config.get("findings_dir") or reports_dir)
     print(f"findings={findings_base / report.run_id / 'findings.md'}")
     print(f"findings_latest={findings_base / 'latest' / 'findings.md'}")
+    print(f"fix_brief={findings_base / report.run_id / 'fix-brief.md'}")
+    print(f"fix_brief_latest={findings_base / 'latest' / 'fix-brief.md'}")
+    print(f"pr_comment={findings_base / report.run_id / 'pr-comment.md'}")
+    print(f"pr_comment_latest={findings_base / 'latest' / 'pr-comment.md'}")
     print(f"summary={findings_base / report.run_id / 'summary.md'}")
     print(f"summary_latest={findings_base / 'latest' / 'summary.md'}")
+    if config.get("feedback_export"):
+        print(f"feedback_export={findings_base / report.run_id / 'feedback-export.json'}")
     print(f"isolated_root={report.isolated_root}")
     if args.sarif:
         try:

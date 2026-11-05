@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.8.0 (2026-11-05)
+
+### Added
+- **Content-hash analysis cache (`core/cache.py`)**: deterministic file-backed cache (`compute_content_hash`, `AnalysisCache`) keyed by core version, namespace, and file SHA-256 content hash.
+- **Controlled Node provisioning & lockfile-pinned tooling cache (`core/toolchain.py`, `action.yml`)**: `select_node_version` selects a supported Node major (`20`, `22`, `24`, default `22`) from `package.json` `engines.node`, `.nvmrc`, or `.node-version`, and `action.yml` caches `~/.cache/qa-ecosystem-tools` keyed on lockfiles.
+- **Container sandbox fallback (`core/sandbox.py`)**: `detect_container_runtime` (`podman` / `docker`), `wrap_container_command` (`--read-only`, `--tmpfs /tmp`, `--tmpfs /home/sandbox`, `--network none`), and `sandbox.fallback: container` support when `bwrap` is unavailable.
+- **Opt-in anonymous feedback export & rule precision downgrade (`core/findings.py`, `core/orchestrator.py`, `main.py`, `action.yml`)**: `--feedback-export true|false` emits `feedback-export.json` containing only rule IDs, finding classes, confidence levels, and feedback labels (`false-positive` / `accepted-risk`), and automatically downgrades unexcepted heuristic findings (`confidence: low`, capped at `P2`) when a rule's false-positive rate exceeds 20%.
+
+## 0.7.0 (2026-11-05)
+
+### Added
+- **Diff-scoped mutation (`core/diffscope.py`, `core/mutation.py`, `core/orchestrator.py`, `core/findings.py`)**: when mutation testing is enabled alongside `--diff <base-ref>`, mutation evaluation is restricted to modified lines in changed source files (`changed_lines`), and surviving mutants emit `riley.mutation` findings (`"No test guards this change"`).
+- **Changed-line coverage and assertion-strength diffing (`core/diffscope.py`, `core/orchestrator.py`, `core/findings.py`)**: tracks `changed_lines` and `uncovered_changed_files` in `DiffScope`, and detects tests whose assertion count decreased versus `base_ref` (`detect_weakened_tests`) to trigger a `VETO`.
+- **Monorepo and workspace support (`core/workspace.py`, `core/orchestrator.py`, `core/findings.py`)**: discovers npm/yarn/pnpm workspaces (`package.json` `workspaces`, `pnpm-workspace.yaml`) and multi-package Python/TS trees (`packages/*`, `apps/*`, `services/*`), checks per-package Node `engines`, attributes findings to `package`, and computes per-package verdicts (`workspace_verdicts`).
+
+## 0.6.0 (2026-11-05)
+
+### Added
+- **Action UX inputs and profiles (`main.py`, `action.yml`, `core/orchestrator.py`, `core/findings.py`)**:
+  - `fail-on: p0|p1|p2|p3` (default `p1`): findings at or above the configured priority trigger `VETO`; lower priorities are emitted as annotations (`WARN` / `INFO`).
+  - `profile: default|factory` (default `default`): `factory` enables `fail-on: p2`, `identity-strict: true`, and `mutation: true` while allowing explicit CLI/Action inputs to override profile defaults.
+  - `fix-brief: true|false` (default `true`): controls whether `fix-brief.md` is generated.
+  - `pr-comment: true|false` (default `false`): generates `reports/<run>/pr-comment.md` and `reports/latest/pr-comment.md` with a concise, prompt-injection-safe PR comment summary and optionally posts it on `pull_request` events.
+- **SARIF 2.1.0 inline annotations at `file:line` (`core/sarif.py`)**: populates `physicalLocation.region.startLine` when positive line numbers are present on findings or test failures.
+- **Versioned findings schema (`docs/findings.schema.json`)**: supports `schema_version` `"1"` and `"1.0.0"`.
+- **Action permissions and trigger hardening (`main.py`, `action.yml`, `.github/workflows/ci.yml`)**: refuses execution under `pull_request_target` and declares minimal `permissions: contents: read` in workflows.
+
+## 0.5.0 (2026-11-05)
+
+### Added
+- **Manifest-based CLI command allow-list (`core/toolchain.py`, `agents/lexi_claims.py`)**: inspects `package.json` (`bin`), `pyproject.toml` (`[project.scripts]`, `[project.gui-scripts]`, `[tool.poetry.scripts]`), `setup.cfg`, and `setup.py` (`console_scripts`, `gui_scripts`) to verify only project-owned CLI commands against project CLI definitions.
+- **Structured Markdown parsing in Lexi (`agents/lexi_claims.py`)**: parses documentation into structured nodes (`prose`, `shell_block`, `code_block`, `fence`, `comment`) and ignores method calls on objects imported from third-party packages.
+- **Finding classification (`class` and `confidence`)**: every finding carries `class: hard|heuristic` and `confidence: high|low`. Low-confidence heuristic findings are capped at `P2` (never `P1`/`P0`).
+- **Flaky test detection in Nova (`core/runner.py`, `core/ts_runner.py`)**: failed test targets are re-executed once under identical isolation; tests that pass on rerun are classified as `FLAKY` instead of causing an immediate `VETO` or a silent pass.
+- **Prompt-injection-proof Fix Brief (`core/brief.py`)**: generates `reports/<run>/fix-brief.md` and `reports/latest/fix-brief.md` with static QA-authored sections and strictly fenced/redacted repository excerpts.
+- **Feedback labelling & Baseline support (`core/exceptions.py`, `core/findings.py`, `main.py`, `action.yml`)**: supports `kind: false-positive | accepted-risk` and `rule` in `.qa-ignore`, emits `false_positive_counts` per rule, and adds `--baseline <path>` so pre-existing recorded findings do not fail the gate.
+- **Twin benchmark fixtures**: `clean_cli_allowlist` / `twin_cli_allowlist` and `clean_call_form_import` / `twin_call_form_import`.
+
+### Changed
+- Removed tracked 8.7 MB `agents/vendor/typescript.js` from git; `ensure_ts_tooling` provisions and verifies the pinned TypeScript compiler (`typescript@5.6.3`, SHA-256 `3ae902c9…e7675`) via the QA cache/bootstrap mechanism and halts with `BLOCKED_ENV` when unavailable offline.
+
 ## 0.4.3 (2026-11-05)
 
 ### Fixed
