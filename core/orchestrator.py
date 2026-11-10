@@ -249,26 +249,30 @@ class Vesper:
                 fail_on = str(self.config.get("fail_on") or "P1").upper()
                 write_brief = bool(self.config.get("fix_brief", not bool()))
                 baseline_fps = self.config.get("baseline_fingerprints")
-                if any((baseline_fps, fail_on != "P1")):
-                    from core.findings import build_document, build_findings
+                from core.findings import (
+                    build_document,
+                    check_verdict_consistent,
+                    verdict_from_findings,
+                )
 
-                    raw_f = build_findings(report.to_dict())
-                    doc_after = build_document(
-                        report.to_dict(),
-                        exceptions=getattr(self, "exceptions", None),
-                        baseline=baseline_fps,
-                        fail_on=fail_on,
-                    )
-                    rem_veto = [
-                        f
-                        for f in (doc_after.get("findings") or [])
-                        if f.get("verdict_effect") == "VETO"
-                    ]
-                    exec_collected = int((report.execution or {}).get("collected") or 0)
-                    if rem_veto:
-                        report.verdict = Verdict.VETO.value
-                    elif all((raw_f, not rem_veto, bool(exec_collected))):
-                        report.verdict = Verdict.CLEAR.value
+                doc_after = build_document(
+                    report.to_dict(),
+                    exceptions=getattr(self, "exceptions", None),
+                    baseline=baseline_fps,
+                    fail_on=fail_on,
+                    config=self.config,
+                    isolated_root=isolation.isolated_root,
+                )
+                # The run verdict is derived only from findings: VETO if and
+                # only if a finding has verdict_effect=VETO (P0/P1 with
+                # evidence, subject to fail-on). Riley/Lexi role verdicts
+                # cannot VETO on their own. BLOCKED_ENV and ESCALATE stay
+                # when no such finding exists.
+                report.verdict = verdict_from_findings(
+                    report.verdict, doc_after.get("findings") or []
+                )
+                doc_after["verdict"] = report.verdict
+                check_verdict_consistent(report.verdict, doc_after.get("findings") or [])
                 write_reports(report, base)
                 findings_base = Path(self.config.get("findings_dir") or base).resolve()
                 write_findings(
@@ -279,6 +283,8 @@ class Vesper:
                     fail_on=fail_on,
                     write_brief=write_brief,
                     feedback_export=bool(self.config.get("feedback_export", bool())),
+                    config=self.config,
+                    isolated_root=isolation.isolated_root,
                 )
         finally:
             release_isolation(isolation, keep=bool(self.config.get("keep_isolated_copy", False)))
@@ -470,6 +476,19 @@ class Vesper:
         report.policy = policy.to_dict()
         if policy.verdict == Verdict.BLOCK.value:
             report.verdict = Verdict.VETO.value
+            return
+        if policy.verdict == Verdict.BLOCKED_ENV.value:
+            # Test-only ops that the sandbox would confine: do not run the
+            # project unsandboxed, and do not accuse the product (VETO).
+            reason = "; ".join(policy.blocked_reasons) or (
+                "sandbox unavailable; tests were not executed"
+            )
+            report.post_audit = {"root_cause": reason}
+            report.mutation = {
+                "status": "skipped",
+                "reason": "environment blocked before execution: sandbox unavailable for test operations",
+            }
+            report.verdict = Verdict.BLOCKED_ENV.value
             return
 
         # TOCTOU guard: pre-flight was evaluated against the sandbox status
@@ -805,6 +824,16 @@ class Vesper:
         # tests did not run"; it never softens a real accusation, and Riley
         # returns BLOCKED_ENV only when no test failed.
         env_blocked = result_review.verdict == Verdict.BLOCKED_ENV.value
+        failed_nodes = [
+            str(item.get("node") or item.get("nodeid") or "").strip()
+            for item in (execution.failures or [])
+            if isinstance(item, dict)
+        ]
+        failed_nodes = [node for node in failed_nodes if node]
+        passed_count = int(execution.passed or 0)
+        failed_label = ", ".join(failed_nodes[:8]) if failed_nodes else "one or more tests failed"
+        baseline_red_reason = f"baseline tests did not pass: {failed_label}"
+
         if post_policy.verdict == Verdict.BLOCK.value:
             # Sable's post-execution block only says the baseline did not pass, so
             # an environmental cause can soften it - except a command that is not
@@ -815,22 +844,26 @@ class Vesper:
                 "reason": (
                     "environment blocked: the tests could not run"
                     if blocked_by_env
-                    else "baseline tests did not pass"
+                    else baseline_red_reason
                 ),
             }
             report.verdict = (
                 Verdict.BLOCKED_ENV.value if blocked_by_env else Verdict.VETO.value
             )
-            return
-        if (nova_failed and not env_blocked) or result_review.verdict == Verdict.VETO.value:
-            report.mutation = {"status": "skipped", "reason": "baseline tests did not pass"}
+            if blocked_by_env or not (passed_count > 0 and failed_nodes and bool((self.config.get("mutation") or {}).get("enabled"))):
+                return
+            # Fall through to a green-subset mutation run after recording the VETO.
+        elif (nova_failed and not env_blocked) or result_review.verdict == Verdict.VETO.value:
+            report.mutation = {"status": "skipped", "reason": baseline_red_reason}
             report.verdict = Verdict.VETO.value
-            return
-        if post_drift.verdict == Verdict.VETO.value:
-            report.mutation = {"status": "skipped", "reason": "baseline tests did not pass"}
+            if not (passed_count > 0 and failed_nodes and bool((self.config.get("mutation") or {}).get("enabled"))):
+                return
+        elif post_drift.verdict == Verdict.VETO.value:
+            report.mutation = {"status": "skipped", "reason": baseline_red_reason}
             report.verdict = Verdict.VETO.value
-            return
-        if drift_veto:
+            if not (passed_count > 0 and failed_nodes and bool((self.config.get("mutation") or {}).get("enabled"))):
+                return
+        elif drift_veto:
             # The stage-1 drift veto: same rank as the post-audit one, applied
             # after Sable and Riley so a stronger accusation is never hidden, and
             # before the environmental softening so a veto is never downgraded.
@@ -840,7 +873,7 @@ class Vesper:
             }
             report.verdict = Verdict.VETO.value
             return
-        if env_blocked:
+        elif env_blocked:
             report.mutation = {
                 "status": "skipped",
                 "reason": "environment blocked: the tests could not run",
@@ -850,17 +883,23 @@ class Vesper:
 
         mutation_cfg = dict(self.config.get("mutation") or {})
         mutation_enabled = bool(mutation_cfg.get("enabled", bool()))
+        green_subset = bool(failed_nodes) and passed_count > 0 and report.verdict == Verdict.VETO.value
 
         if not mutation_enabled:
             skip_reason = "diff mode" if self._scope is not None else "disabled"
+            if report.verdict == Verdict.VETO.value and failed_nodes:
+                skip_reason = baseline_red_reason
             report.mutation = {"status": "skipped", "reason": skip_reason}
+            if report.verdict == Verdict.VETO.value:
+                return
         else:
+            if green_subset:
+                mutation_cfg = {**mutation_cfg, "deselect": list(failed_nodes)}
             run_cfg = dict(self.config)
+            run_mut = dict(mutation_cfg)
             if self._scope is not None:
-                run_cfg["mutation"] = {
-                    **mutation_cfg,
-                    "allowed_lines": dict(getattr(self._scope, "changed_lines", {})),
-                }
+                run_mut["allowed_lines"] = dict(getattr(self._scope, "changed_lines", {}))
+            run_cfg["mutation"] = run_mut
             py_bin = None
             venv_py = venv_python(work_dir)
             if venv_py.is_file():
@@ -876,6 +915,12 @@ class Vesper:
             )
             if self._scope is not None:
                 mut_res["diff_scoped"] = not bool()
+            if green_subset:
+                mut_res["status"] = "completed_green_subset"
+                mut_res["reason"] = (
+                    f"{baseline_red_reason}; mutation ran on the passing subset"
+                    + (f" ({mut_res.get('reason')})" if mut_res.get("reason") else "")
+                )
             report.timings["mutation"] = round(time.monotonic() - _mutation_started, 3)
             report.mutation = mut_res
             append_result(
@@ -891,6 +936,13 @@ class Vesper:
             if mut_res.get("verdict") == Verdict.VETO.value:
                 report.verdict = Verdict.VETO.value
                 return
+            if report.verdict == Verdict.VETO.value:
+                # Baseline already failed; a clean mutation result must not
+                # clear that accusation.
+                return
+
+        if report.verdict == Verdict.VETO.value:
+            return
 
         append_result(
             self.role_results,

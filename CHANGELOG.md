@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.8.4 (2026-11-10)
+
+### Fixed
+- **Run verdict is derived only from findings.** A `VETO` is issued if and only if a finding has `verdict_effect=VETO` (a P0/P1 finding with evidence, subject to `fail-on`). Riley post-audit can no longer VETO on its own when every finding is P2 `WARN`. A `VETO` verdict without a `VETO` finding is impossible, and a `VETO` finding always yields `VETO`. `BLOCKED_ENV` and `ESCALATE` are preserved when no such finding exists.
+- **Truly hollow tests are P1 with `file:line`.** A leftover `.only`, a literal tautology (`assert True`, `assert 1 == 1`), a `pass` / `...` / docstring-only body, or a `try/except` that swallows `AssertionError` is P1. A handler swallows asserts only when it catches `AssertionError`, `Exception` or `BaseException`, is a bare `except:`, or catches a tuple including those, *and* does not re-raise or fail. A narrow `except UnicodeDecodeError: pass` (or `KeyError`, etc.) does not swallow. A test with no explicit assert that still calls code (and can raise), including `pytest.raises`, stays P2 `WARN`. Skipped, trivial, and snapshot-only tests stay P2, including when a loosely matched docs claim mentions security or the sandbox. Uncovered or weak-only claims stay P2 `WARN` and never VETO, even under `--strict` / `veto_on_uncovered_claims`. Claim findings now carry the docs `file:line` when it can be located.
+- **A mutation score below `--mutation-min-score`** is a P1 mutation finding, so that VETO is always backed by a finding.
+
+### Added
+- Benchmark seed `privacy_swallowed_test` (KeyHive-shaped privacy test whose `try/except` swallows assertions): `VETO` with a P1 `weak_test` on `tests/test_fulfillment.py:4`.
+
+
+## 0.8.3 (2026-11-10)
+
+### Fixed
+- **GitHub Action wrapper no longer dies before writing outputs on a normal VETO.** After `main.py` prints the verdict, the wrapper (under GitHub's `bash -eo pipefail`) grepped `^feedback_export=`, a line that is only emitted when the `feedback-export` input is true (default false). `grep` exited 1, the step aborted before `GITHUB_OUTPUT` or the report artifact, and a VETO looked like a silent failure. `scripts/gha_finish.sh` now treats missing keys as empty, always writes outputs, prints P0/P1 findings (file:line and reason) to the step log and summary, then exits with the cycle code (0/1/2). The Action also uploads `qa-reports/` with `if: always()`. `main.py` always prints `feedback_export=` (empty when the flag is off).
+
+
+## 0.8.2 (2026-11-10)
+
+### Fixed
+- **Sable unsandboxed test operations are an environment stop, not a product VETO.** When bubblewrap is unavailable, operations the sandbox would confine (subprocess, eval, deletes, and test-local network helpers) return `BLOCKED_ENV` (exit 2) instead of `VETO`. Tests are never executed unsandboxed. The report includes a ready-to-paste `sable.allow_in_tests` YAML block. Hits that would still block under the sandbox (for example `os.system` in production source) remain a `VETO`.
+- **Sable runtime guard allows loopback-only sockets.** With `allow_network` false, `socket.connect` to `127.0.0.1`, `::1`, other loopback addresses, and conventional `localhost` names is permitted so in-process HTTP tests can talk to a local server. External destinations still raise. `NO_PROXY`/`no_proxy` now include `127.0.0.1,::1,localhost` so urllib is not sent to the dead proxy on loopback.
+- **Lexi drops documented-but-not-API noise.** Sphinx inventory references (`genindex`, `modindex`, a Sphinx `:ref:` search link), dunder methods, prose placeholders and example identifiers (including `rowIDs`), historical-only changelog mentions (`DEFAULT_CURRENCY` in `CHANGES.rst`), and `$DEITY`-style dollar words that are not environment variables are no longer findings. `pip install pytest-*` and other tool packages are not install-instruction mismatches. Promised APIs such as a documented `divide` that is missing from code are still reported.
+- **Mutation on a red baseline** records the failing node ids in the skip reason. When some tests passed and mutation is enabled, mutation runs on the passing subset (`pytest --deselect=`). The overall verdict stays `VETO` for the red tests.
+- **Likely-equivalent mutants** (a `return` value unused by every caller, e.g. a helper that only mutates and returns its input) are marked, listed separately, and excluded from the score penalty. If later killed they still count as killed. Tests are never skipped or xfailed to hide a survivor.
+
+### Added
+- **Optional LLM triage** of already-emitted ambiguous findings (doc drift, claims, likely-equivalent mutants). The model may only downgrade or annotate, never create or upgrade a finding, and never clear a P0 that has evidence. When the LLM is off or unavailable the deterministic result is unchanged. A `mock` provider (`llm.provider: mock`, `llm.mock_response`) is available for tests. Lexi, Aria, and Riley no longer merge model output into their heuristic results.
+
 ## 0.8.1 (2026-11-06)
 
 ### Fixed

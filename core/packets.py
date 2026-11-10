@@ -126,6 +126,8 @@ class Scenario:
     covered_by: list[str] = field(default_factory=list)
     score: int = 0
     covered_by_weak: list[str] = field(default_factory=list)
+    docs_file: str | None = None
+    docs_line: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -168,6 +170,11 @@ class PolicyDecision:
     command: list[str] = field(default_factory=list)
     allowed: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # When the sandbox is off, test-only ops that the sandbox would confine
+    # become an environment stop (not a product VETO). The YAML is a
+    # ready-to-paste operator allow_in_tests block.
+    allowlist_yaml: str = ""
+    environment_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
